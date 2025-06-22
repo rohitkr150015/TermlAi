@@ -7,9 +7,13 @@ import os
 import json
 import logging
 import platform
-from datetime import datetime
+import re
+import shutil
+import tempfile
+import ctypes
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Union
 
 
 class ConfigManager:
@@ -67,16 +71,24 @@ class ConfigManager:
         """Load configuration from file or create default"""
         if self.config_file.exists():
             try:
-                with open(self.config_file, 'r') as f:
+                with open(self.config_file, 'r', encoding='utf-8') as f:
                     user_config = json.load(f)
 
                 # Merge with defaults
                 config = self.default_config.copy()
                 config.update(user_config)
 
+                # Validate loaded config
+                if not self.validate_config(config):
+                    print("⚠️  Config validation failed, using defaults with user overrides")
+                    config = self._merge_safe_config(user_config)
+
                 print(f"✅ Configuration loaded from {self.config_file}")
                 return config
 
+            except json.JSONDecodeError as e:
+                print(f"❌ Error parsing config JSON: {e}")
+                print("🔧 Using default configuration")
             except Exception as e:
                 print(f"❌ Error loading config: {e}")
                 print("🔧 Using default configuration")
@@ -85,14 +97,36 @@ class ConfigManager:
         self.save_config(self.default_config)
         return self.default_config.copy()
 
+    def _merge_safe_config(self, user_config: Dict[str, Any]) -> Dict[str, Any]:
+        """Safely merge user config with defaults, skipping invalid values"""
+        config = self.default_config.copy()
+        
+        for key, value in user_config.items():
+            if key in self.default_config:
+                # Type checking
+                default_type = type(self.default_config[key])
+                if isinstance(value, default_type):
+                    config[key] = value
+                else:
+                    print(f"⚠️  Invalid type for {key}, using default")
+            else:
+                print(f"⚠️  Unknown config key: {key}, ignoring")
+        
+        return config
+
     def save_config(self, config: Dict[str, Any]):
         """Save configuration to file"""
         try:
             # Update last_updated timestamp
             config["last_updated"] = datetime.now().strftime("%Y-%m-%d")
             
-            with open(self.config_file, 'w') as f:
-                json.dump(config, f, indent=2)
+            # Create backup of existing config
+            if self.config_file.exists():
+                backup_path = self.config_file.with_suffix('.json.backup')
+                shutil.copy2(self.config_file, backup_path)
+            
+            with open(self.config_file, 'w', encoding='utf-8') as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
             print(f"✅ Configuration saved to {self.config_file}")
         except Exception as e:
             print(f"❌ Error saving config: {e}")
@@ -101,12 +135,36 @@ class ConfigManager:
         """Update a single configuration value"""
         try:
             config = self.load_config()
+            
+            # Validate the specific key-value pair
+            if not self._validate_config_item(key, value):
+                print(f"❌ Invalid value for {key}")
+                return False
+                
             config[key] = value
             self.save_config(config)
             return True
         except Exception as e:
             print(f"❌ Error updating config: {e}")
             return False
+
+    def _validate_config_item(self, key: str, value: Any) -> bool:
+        """Validate a single configuration item"""
+        validators = {
+            "safety_level": lambda v: v in ["strict", "normal", "permissive"],
+            "max_execution_time": lambda v: isinstance(v, (int, float)) and v > 0,
+            "audio_timeout": lambda v: isinstance(v, (int, float)) and v > 0,
+            "audio_sample_rate": lambda v: isinstance(v, int) and v > 0,
+            "audio_channels": lambda v: isinstance(v, int) and v in [1, 2],
+            "whisper_model_size": lambda v: v in ["tiny", "tiny.en", "base", "base.en", "small", "small.en", "medium", "medium.en", "large"],
+            "whisper_device": lambda v: v in ["cpu", "cuda", "auto"],
+            "log_level": lambda v: v in ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+            "ollama_host": lambda v: isinstance(v, str) and (v.startswith("http://") or v.startswith("https://")),
+        }
+        
+        if key in validators:
+            return validators[key](value)
+        return True
 
     def reset_config(self):
         """Reset configuration to defaults"""
@@ -123,19 +181,49 @@ class ConfigManager:
                     print(f"❌ Missing required config key: {key}")
                     return False
 
-            # Validate specific values
-            if config.get("safety_level") not in ["strict", "normal", "permissive"]:
-                print("❌ Invalid safety_level. Must be: strict, normal, or permissive")
-                return False
-
-            if config.get("max_execution_time", 0) <= 0:
-                print("❌ max_execution_time must be greater than 0")
-                return False
+            # Validate specific values using individual validators
+            for key, value in config.items():
+                if not self._validate_config_item(key, value):
+                    print(f"❌ Invalid value for {key}: {value}")
+                    return False
 
             return True
 
         except Exception as e:
             print(f"❌ Config validation error: {e}")
+            return False
+
+    def export_config(self, export_path: Optional[str] = None) -> str:
+        """Export current configuration to a file"""
+        if not export_path:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            export_path = f"config_backup_{timestamp}.json"
+        
+        try:
+            config = self.load_config()
+            with open(export_path, 'w', encoding='utf-8') as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+            print(f"✅ Configuration exported to {export_path}")
+            return export_path
+        except Exception as e:
+            print(f"❌ Error exporting config: {e}")
+            return ""
+
+    def import_config(self, import_path: str) -> bool:
+        """Import configuration from a file"""
+        try:
+            with open(import_path, 'r', encoding='utf-8') as f:
+                imported_config = json.load(f)
+            
+            if self.validate_config(imported_config):
+                self.save_config(imported_config)
+                print(f"✅ Configuration imported from {import_path}")
+                return True
+            else:
+                print(f"❌ Invalid configuration in {import_path}")
+                return False
+        except Exception as e:
+            print(f"❌ Error importing config: {e}")
             return False
 
 
@@ -151,6 +239,7 @@ class Logger:
         self.history_file = self.log_dir / "history.log"
         self.error_file = self.log_dir / "errors.log"
         self.info_file = self.log_dir / "info.log"
+        self.session_file = self.log_dir / f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 
         # Set up Python logging
         self.setup_logging()
@@ -158,6 +247,7 @@ class Logger:
         # In-memory history for quick access
         self.interaction_history = []
         self.command_history = []
+        self.session_start = datetime.now()
 
         # Load existing history
         self.load_history()
@@ -176,11 +266,17 @@ class Logger:
         # Clear existing handlers
         self.logger.handlers.clear()
 
-        # File handler
-        file_handler = logging.FileHandler(self.log_dir / "termiai.log")
+        # File handler for main log
+        file_handler = logging.FileHandler(self.log_dir / "termiai.log", encoding='utf-8')
         file_handler.setFormatter(formatter)
         file_handler.setLevel(logging.INFO)
         self.logger.addHandler(file_handler)
+
+        # Session-specific handler
+        session_handler = logging.FileHandler(self.session_file, encoding='utf-8')
+        session_handler.setFormatter(formatter)
+        session_handler.setLevel(logging.DEBUG)
+        self.logger.addHandler(session_handler)
 
         # Console handler (optional - can be disabled)
         console_handler = logging.StreamHandler()
@@ -192,11 +288,12 @@ class Logger:
         """Log user interaction"""
         entry = {
             "timestamp": datetime.now().isoformat(),
-            "user_input": user_input,
-            "command": command,
+            "user_input": user_input.strip(),
+            "command": command.strip(),
             "executed": executed,
             "input_type": input_type,  # "voice" or "text"
-            "platform": platform.system()
+            "platform": platform.system(),
+            "session_id": id(self)  # Simple session identifier
         }
 
         self.interaction_history.append(entry)
@@ -206,14 +303,16 @@ class Logger:
         if len(self.interaction_history) > 100:
             self.interaction_history = self.interaction_history[-100:]
 
-    def log_command_execution(self, command: str, status: str, output: str = ""):
+    def log_command_execution(self, command: str, status: str, output: str = "", execution_time: float = 0):
         """Log command execution details"""
         entry = {
             "timestamp": datetime.now().isoformat(),
-            "command": command,
-            "status": status,  # "started", "success", "failed", "error"
-            "output": output[:500] if output else "",  # Limit output length
-            "platform": platform.system()
+            "command": command.strip(),
+            "status": status,  # "started", "success", "failed", "error", "timeout"
+            "output": self._truncate_output(output),
+            "execution_time": execution_time,
+            "platform": platform.system(),
+            "session_id": id(self)
         }
 
         self.command_history.append(entry)
@@ -223,32 +322,49 @@ class Logger:
         if len(self.command_history) > 100:
             self.command_history = self.command_history[-100:]
 
-    def log_error(self, error_message: str, context: str = ""):
+    def _truncate_output(self, output: str, max_length: int = 1000) -> str:
+        """Truncate command output for logging"""
+        if not output:
+            return ""
+        
+        output = output.strip()
+        if len(output) <= max_length:
+            return output
+        
+        return output[:max_length] + f"\n... [truncated {len(output) - max_length} characters]"
+
+    def log_error(self, error_message: str, context: str = "", exception: Optional[Exception] = None):
         """Log error messages"""
+        error_details = str(error_message)
+        if exception:
+            error_details += f" | Exception: {type(exception).__name__}: {str(exception)}"
+        
         entry = {
             "timestamp": datetime.now().isoformat(),
             "type": "error",
-            "message": error_message,
-            "context": context
+            "message": error_details,
+            "context": context,
+            "session_id": id(self)
         }
 
         self._save_to_file(entry, "error")
-        self.logger.error(f"{context}: {error_message}" if context else error_message)
+        self.logger.error(f"{context}: {error_details}" if context else error_details)
 
         # Also save to dedicated error file
         try:
             with open(self.error_file, 'a', encoding='utf-8') as f:
-                f.write(f"{entry['timestamp']} - {context}: {error_message}\n")
-        except:
-            pass
+                f.write(f"{entry['timestamp']} - {context}: {error_details}\n")
+        except Exception:
+            pass  # Avoid infinite error loops
 
     def log_info(self, message: str, context: str = ""):
         """Log informational messages"""
         entry = {
             "timestamp": datetime.now().isoformat(),
             "type": "info",
-            "message": message,
-            "context": context
+            "message": str(message),
+            "context": context,
+            "session_id": id(self)
         }
 
         self._save_to_file(entry, "info")
@@ -258,18 +374,32 @@ class Logger:
         try:
             with open(self.info_file, 'a', encoding='utf-8') as f:
                 f.write(f"{entry['timestamp']} - {context}: {message}\n")
-        except:
+        except Exception:
             pass
+
+    def log_system_event(self, event_type: str, details: Dict[str, Any]):
+        """Log system events like startup, shutdown, config changes"""
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "type": "system_event",
+            "event_type": event_type,
+            "details": details,
+            "session_id": id(self)
+        }
+        
+        self._save_to_file(entry, "system")
+        self.logger.info(f"System event: {event_type} - {details}")
 
     def _save_to_file(self, entry: Dict, entry_type: str):
         """Save log entry to file"""
         try:
-            log_line = f"[{entry_type.upper()}] {json.dumps(entry)}\n"
+            log_line = f"[{entry_type.upper()}] {json.dumps(entry, ensure_ascii=False)}\n"
 
             with open(self.history_file, 'a', encoding='utf-8') as f:
                 f.write(log_line)
 
         except Exception as e:
+            # Use print to avoid infinite recursion
             print(f"❌ Error saving to log file: {e}")
 
     def load_history(self):
@@ -279,20 +409,24 @@ class Logger:
 
         try:
             with open(self.history_file, 'r', encoding='utf-8') as f:
-                for line in f:
+                for line_num, line in enumerate(f, 1):
                     line = line.strip()
                     if not line:
                         continue
 
-                    # Parse log entry
-                    if line.startswith('[INTERACTION]'):
-                        entry_json = line[13:].strip()
-                        entry = json.loads(entry_json)
-                        self.interaction_history.append(entry)
-                    elif line.startswith('[COMMAND]'):
-                        entry_json = line[9:].strip()
-                        entry = json.loads(entry_json)
-                        self.command_history.append(entry)
+                    try:
+                        # Parse log entry
+                        if line.startswith('[INTERACTION]'):
+                            entry_json = line[13:].strip()
+                            entry = json.loads(entry_json)
+                            self.interaction_history.append(entry)
+                        elif line.startswith('[COMMAND]'):
+                            entry_json = line[9:].strip()
+                            entry = json.loads(entry_json)
+                            self.command_history.append(entry)
+                    except json.JSONDecodeError:
+                        print(f"⚠️  Skipping malformed log entry at line {line_num}")
+                        continue
 
             # Keep only recent entries
             self.interaction_history = self.interaction_history[-100:]
@@ -305,11 +439,30 @@ class Logger:
 
     def get_recent_history(self, limit: int = 10) -> List[Dict]:
         """Get recent interaction history"""
-        return self.interaction_history[-limit:]
+        return self.interaction_history[-limit:] if self.interaction_history else []
 
     def get_command_history(self, limit: int = 10) -> List[Dict]:
         """Get recent command execution history"""
-        return self.command_history[-limit:]
+        return self.command_history[-limit:] if self.command_history else []
+
+    def search_history(self, query: str, history_type: str = "all") -> List[Dict]:
+        """Search through history"""
+        results = []
+        query_lower = query.lower()
+        
+        if history_type in ["all", "interaction"]:
+            for entry in self.interaction_history:
+                if (query_lower in entry.get("user_input", "").lower() or 
+                    query_lower in entry.get("command", "").lower()):
+                    results.append(entry)
+        
+        if history_type in ["all", "command"]:
+            for entry in self.command_history:
+                if (query_lower in entry.get("command", "").lower() or 
+                    query_lower in entry.get("output", "").lower()):
+                    results.append(entry)
+        
+        return sorted(results, key=lambda x: x.get("timestamp", ""))
 
     def clear_history(self):
         """Clear all history"""
@@ -320,7 +473,8 @@ class Logger:
         files_to_clear = [self.history_file, self.error_file, self.info_file]
         for file_path in files_to_clear:
             try:
-                file_path.unlink(missing_ok=True)
+                if file_path.exists():
+                    file_path.unlink()
             except Exception as e:
                 print(f"❌ Error clearing {file_path}: {e}")
 
@@ -335,15 +489,18 @@ class Logger:
         try:
             export_data = {
                 "export_timestamp": datetime.now().isoformat(),
+                "session_start": self.session_start.isoformat(),
                 "platform": platform.system(),
+                "python_version": platform.python_version(),
                 "interaction_history": self.interaction_history,
                 "command_history": self.command_history,
+                "statistics": self.get_log_stats(),
                 "total_interactions": len(self.interaction_history),
                 "total_commands": len(self.command_history)
             }
 
             with open(output_file, 'w', encoding='utf-8') as f:
-                json.dump(export_data, f, indent=2)
+                json.dump(export_data, f, indent=2, ensure_ascii=False)
 
             print(f"✅ History exported to {output_file}")
             return output_file
@@ -355,6 +512,7 @@ class Logger:
     def get_log_stats(self) -> Dict[str, Any]:
         """Get logging statistics"""
         stats = {
+            "session_duration": str(datetime.now() - self.session_start),
             "total_interactions": len(self.interaction_history),
             "total_commands": len(self.command_history),
             "successful_commands": sum(1 for cmd in self.command_history if cmd.get("status") == "success"),
@@ -367,6 +525,13 @@ class Logger:
             stats["success_rate"] = round((stats["successful_commands"] / stats["total_commands"]) * 100, 2)
         else:
             stats["success_rate"] = 0
+
+        # Add average execution time
+        execution_times = [cmd.get("execution_time", 0) for cmd in self.command_history if cmd.get("execution_time")]
+        if execution_times:
+            stats["avg_execution_time"] = round(sum(execution_times) / len(execution_times), 2)
+        else:
+            stats["avg_execution_time"] = 0
 
         return stats
 
@@ -383,7 +548,7 @@ class Logger:
                 backup_path = log_file.parent / backup_name
                 
                 try:
-                    log_file.rename(backup_path)
+                    shutil.move(str(log_file), str(backup_path))
                     print(f"📦 Rotated log file: {log_file} -> {backup_path}")
                 except Exception as e:
                     print(f"❌ Error rotating log file {log_file}: {e}")
@@ -399,7 +564,7 @@ class PlatformUtils:
 
     def _get_platform_info(self) -> Dict[str, str]:
         """Get detailed platform information"""
-        return {
+        info = {
             "system": platform.system(),
             "release": platform.release(),
             "version": platform.version(),
@@ -408,6 +573,28 @@ class PlatformUtils:
             "python_version": platform.python_version(),
             "architecture": platform.architecture()[0]
         }
+        
+        # Add platform-specific info
+        if self.platform == "linux":
+            try:
+                # Try to get Linux distribution info
+                with open("/etc/os-release", "r") as f:
+                    os_release = f.read()
+                    for line in os_release.split("\n"):
+                        if line.startswith("PRETTY_NAME="):
+                            info["distribution"] = line.split("=")[1].strip('"')
+                            break
+            except:
+                info["distribution"] = "Unknown Linux"
+        
+        elif self.platform == "darwin":
+            info["macos_version"] = platform.mac_ver()[0]
+        
+        elif self.platform == "windows":
+            info["windows_version"] = platform.win32_ver()[0]
+            info["windows_edition"] = platform.win32_edition()
+        
+        return info
 
     def get_platform(self) -> str:
         """Get simplified platform name"""
@@ -421,9 +608,17 @@ class PlatformUtils:
     def get_shell_command(self) -> str:
         """Get default shell command for platform"""
         if self.platform == "windows":
+            # Check if PowerShell is available
+            if shutil.which("powershell"):
+                return "powershell"
             return "cmd"
         else:
-            return "bash"
+            # Check available shells
+            shells = ["/bin/zsh", "/bin/bash", "/bin/sh"]
+            for shell in shells:
+                if Path(shell).exists():
+                    return shell
+            return "bash"  # fallback
 
     def get_path_separator(self) -> str:
         """Get path separator for platform"""
@@ -431,10 +626,8 @@ class PlatformUtils:
 
     def normalize_path(self, path: str) -> str:
         """Normalize path for current platform"""
-        if self.platform == "windows":
-            return path.replace("/", "\\")
-        else:
-            return path.replace("\\", "/")
+        normalized = Path(path).as_posix() if self.platform != "windows" else str(Path(path)).replace("/", "\\")
+        return normalized
 
     def get_home_directory(self) -> str:
         """Get user home directory"""
@@ -442,34 +635,74 @@ class PlatformUtils:
 
     def get_temp_directory(self) -> str:
         """Get system temp directory"""
-        import tempfile
         return tempfile.gettempdir()
 
     def get_documents_folder(self) -> str:
         """Get user documents folder"""
-        if self.platform == "windows":
-            return os.path.join(self.get_home_directory(), "Documents")
-        else:
-            return os.path.join(self.get_home_directory(), "Documents")
+        home = Path.home()
+        documents_paths = {
+            "windows": home / "Documents",
+            "darwin": home / "Documents",
+            "linux": home / "Documents"
+        }
+        return str(documents_paths.get(self.platform, home / "Documents"))
 
     def get_downloads_folder(self) -> str:
         """Get user downloads folder"""
-        return os.path.join(self.get_home_directory(), "Downloads")
+        home = Path.home()
+        downloads_paths = {
+            "windows": home / "Downloads",
+            "darwin": home / "Downloads", 
+            "linux": home / "Downloads"
+        }
+        return str(downloads_paths.get(self.platform, home / "Downloads"))
 
     def get_desktop_folder(self) -> str:
         """Get user desktop folder"""
-        return os.path.join(self.get_home_directory(), "Desktop")
+        home = Path.home()
+        desktop_paths = {
+            "windows": home / "Desktop",
+            "darwin": home / "Desktop",
+            "linux": home / "Desktop"
+        }
+        return str(desktop_paths.get(self.platform, home / "Desktop"))
 
     def is_admin(self) -> bool:
         """Check if running with admin privileges"""
         try:
             if self.platform == "windows":
-                import ctypes
-                return ctypes.windll.shell32.IsUserAnAdmin()
+                return bool(ctypes.windll.shell32.IsUserAnAdmin())
             else:
                 return os.geteuid() == 0
-        except:
+        except Exception:
             return False
+
+    def get_available_drives(self) -> List[str]:
+        """Get available drives (Windows) or mount points (Unix)"""
+        drives = []
+        
+        if self.platform == "windows":
+            # Get Windows drive letters
+            import string
+            for letter in string.ascii_uppercase:
+                drive = f"{letter}:\\"
+                if os.path.exists(drive):
+                    drives.append(drive)
+        else:
+            # Get Unix mount points
+            try:
+                with open("/proc/mounts", "r") as f:
+                    for line in f:
+                        parts = line.split()
+                        if len(parts) >= 2 and parts[1].startswith("/"):
+                            mount_point = parts[1]
+                            if not mount_point.startswith(("/proc", "/sys", "/dev")):
+                                drives.append(mount_point)
+                drives = sorted(list(set(drives)))
+            except:
+                drives = ["/"]
+        
+        return drives
 
     def get_system_info(self) -> Dict[str, Any]:
         """Get comprehensive system information"""
@@ -485,12 +718,12 @@ class PlatformUtils:
             "path_separator": self.get_path_separator(),
             "documents_folder": self.get_documents_folder(),
             "downloads_folder": self.get_downloads_folder(),
-            "desktop_folder": self.get_desktop_folder()
+            "desktop_folder": self.get_desktop_folder(),
+            "available_drives": self.get_available_drives()
         })
 
         # Add disk space info
         try:
-            import shutil
             total, used, free = shutil.disk_usage(os.getcwd())
             info["disk_space"] = {
                 "total_gb": round(total / (1024 ** 3), 2),
@@ -498,10 +731,10 @@ class PlatformUtils:
                 "free_gb": round(free / (1024 ** 3), 2),
                 "usage_percent": round((used / total) * 100, 2)
             }
-        except:
+        except Exception:
             info["disk_space"] = "unavailable"
 
-        # Add memory info (if available)
+        # Add memory info (if psutil is available)
         try:
             import psutil
             memory = psutil.virtual_memory()
@@ -510,317 +743,47 @@ class PlatformUtils:
                 "available_gb": round(memory.available / (1024 ** 3), 2),
                 "used_percent": memory.percent
             }
+            
+            # CPU info
+            info["cpu"] = {
+                "count": psutil.cpu_count(),
+                "usage_percent": psutil.cpu_percent(interval=1)
+            }
         except ImportError:
             info["memory"] = "psutil not available"
-        except:
+            info["cpu"] = "psutil not available"
+        except Exception:
             info["memory"] = "unavailable"
+            info["cpu"] = "unavailable"
 
         return info
 
     def get_env_vars(self) -> Dict[str, str]:
         """Get important environment variables"""
-        important_vars = ["PATH", "HOME", "USER", "SHELL", "TERM", "PYTHON_PATH"]
+        important_vars = ["PATH", "HOME", "USER", "SHELL", "TERM", "PYTHONPATH"]
+        
         if self.platform == "windows":
-            important_vars.extend(["USERPROFILE", "USERNAME", "COMPUTERNAME", "OS"])
+            important_vars.extend(["USERPROFILE", "USERNAME", "COMPUTERNAME", "OS", "PROCESSOR_ARCHITECTURE"])
+        else:
+            important_vars.extend(["PWD", "OLDPWD", "DISPLAY"])
 
         return {var: os.environ.get(var, "Not set") for var in important_vars}
 
-
-class ColorUtils:
-    """Utilities for colored terminal output"""
-
-    # ANSI color codes
-    COLORS = {
-        'reset': '\033[0m',
-        'bold': '\033[1m',
-        'dim': '\033[2m',
-        'underline': '\033[4m',
-        'red': '\033[31m',
-        'green': '\033[32m',
-        'yellow': '\033[33m',
-        'blue': '\033[34m',
-        'magenta': '\033[35m',
-        'cyan': '\033[36m',
-        'white': '\033[37m',
-        'gray': '\033[90m',
-        'bright_red': '\033[91m',
-        'bright_green': '\033[92m',
-        'bright_yellow': '\033[93m',
-        'bright_blue': '\033[94m',
-        'bright_magenta': '\033[95m',
-        'bright_cyan': '\033[96m'
-    }
-
-    @classmethod
-    def colorize(cls, text: str, color: str, bold: bool = False) -> str:
-        """Add color to text"""
-        if not cls.is_color_supported():
-            return text
-            
-        color_code = cls.COLORS.get(color, '')
-        bold_code = cls.COLORS['bold'] if bold else ''
-        reset_code = cls.COLORS['reset']
+    def get_network_info(self) -> Dict[str, Any]:
+        """Get basic network information"""
+        network_info = {}
         
-        return f"{bold_code}{color_code}{text}{reset_code}"
-
-    @classmethod
-    def is_color_supported(cls) -> bool:
-        """Check if terminal supports colors"""
-        return hasattr(os, 'isatty') and os.isatty(1)
-
-    @classmethod
-    def success(cls, text: str, bold: bool = True) -> str:
-        """Green text for success messages"""
-        return cls.colorize(text, 'bright_green', bold)
-
-    @classmethod
-    def error(cls, text: str, bold: bool = True) -> str:
-        """Red text for error messages"""
-        return cls.colorize(text, 'bright_red', bold)
-
-    @classmethod
-    def warning(cls, text: str, bold: bool = True) -> str:
-        """Yellow text for warning messages"""
-        return cls.colorize(text, 'bright_yellow', bold)
-
-    @classmethod
-    def info(cls, text: str, bold: bool = False) -> str:
-        """Blue text for info messages"""
-        return cls.colorize(text, 'bright_blue', bold)
-
-    @classmethod
-    def highlight(cls, text: str, bold: bool = True) -> str:
-        """Cyan text for highlighted content"""
-        return cls.colorize(text, 'bright_cyan', bold)
-
-    @classmethod
-    def dim(cls, text: str) -> str:
-        """Dim text for less important content"""
-        return cls.colorize(text, 'gray', False)
-
-
-class FileUtils:
-    """File and directory utilities"""
-
-    @staticmethod
-    def ensure_directory(directory: str) -> bool:
-        """Ensure directory exists, create if it doesn't"""
         try:
-            Path(directory).mkdir(parents=True, exist_ok=True)
-            return True
-        except Exception as e:
-            print(f"❌ Error creating directory {directory}: {e}")
-            return False
-
-    @staticmethod
-    def safe_filename(filename: str) -> str:
-        """Create a safe filename by removing invalid characters"""
-        invalid_chars = '<>:"/\\|?*'
-        for char in invalid_chars:
-            filename = filename.replace(char, '_')
-        return filename
-
-    @staticmethod
-    def get_file_size(filepath: str) -> int:
-        """Get file size in bytes"""
-        try:
-            return Path(filepath).stat().st_size
-        except:
-            return 0
-
-    @staticmethod
-    def backup_file(filepath: str) -> str:
-        """Create a backup of a file"""
-        try:
-            original = Path(filepath)
-            if not original.exists():
-                return ""
-
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            backup_name = f"{original.stem}_backup_{timestamp}{original.suffix}"
-            backup_path = original.parent / backup_name
+            import socket
+            hostname = socket.gethostname()
+            network_info["hostname"] = hostname
             
-            import shutil
-            shutil.copy2(original, backup_path)
-            
-            return str(backup_path)
-        except Exception as e:
-            print(f"❌ Error creating backup: {e}")
-            return ""
-
-    @staticmethod
-    def cleanup_old_files(directory: str, days_old: int = 30, pattern: str = "*"):
-        """Clean up old files in a directory"""
-        try:
-            from datetime import timedelta
-            cutoff_time = datetime.now() - timedelta(days=days_old)
-            directory_path = Path(directory)
-            
-            if not directory_path.exists():
-                return
-                
-            deleted_count = 0
-            for file_path in directory_path.glob(pattern):
-                if file_path.is_file():
-                    file_time = datetime.fromtimestamp(file_path.stat().st_mtime)
-                    if file_time < cutoff_time:
-                        file_path.unlink()
-                        deleted_count += 1
-                        
-            if deleted_count > 0:
-                print(f"🗑️  Cleaned up {deleted_count} old files from {directory}")
-                
-        except Exception as e:
-            print(f"❌ Error cleaning up files: {e}")
-
-
-def format_file_size(size_bytes: int) -> str:
-    """Format file size in human readable format"""
-    if size_bytes == 0:
-        return "0 B"
-
-    size_names = ["B", "KB", "MB", "GB", "TB"]
-    i = 0
-    while size_bytes >= 1024 and i < len(size_names) - 1:
-        size_bytes /= 1024
-        i += 1
-
-    return f"{size_bytes:.1f} {size_names[i]}"
-
-
-def format_duration(seconds: float) -> str:
-    """Format duration in human readable format"""
-    if seconds < 1:
-        return f"{seconds * 1000:.0f}ms"
-    elif seconds < 60:
-        return f"{seconds:.1f}s"
-    elif seconds < 3600:
-        minutes = int(seconds // 60)
-        secs = int(seconds % 60)
-        return f"{minutes}m {secs}s"
-    else:
-        hours = int(seconds // 3600)
-        minutes = int((seconds % 3600) // 60)
-        return f"{hours}h {minutes}m"
-
-
-def validate_url(url: str) -> bool:
-    """Validate if string is a valid URL"""
-    import re
-    pattern = re.compile(
-        r'^https?://'  # http:// or https://
-        r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+[A-Z]{2,6}\.?|'  # domain...
-        r'localhost|'  # localhost...
-        r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'  # ...or ip
-        r'(?::\d+)?'  # optional port
-        r'(?:/?|[/?]\S+)$', re.IGNORECASE)
-
-    return pattern.match(url) is not None
-
-
-def get_system_command_examples() -> Dict[str, List[str]]:
-    """Get platform-specific command examples"""
-    system = platform.system().lower()
-    
-    if system == "windows":
-        return {
-            "File Operations": [
-                "dir - List directory contents",
-                "mkdir folder_name - Create directory",
-                "rmdir folder_name - Remove directory",
-                "copy file1.txt file2.txt - Copy file",
-                "move file1.txt new_location\\ - Move file",
-                "del file.txt - Delete file"
-            ],
-            "System Info": [
-                "systeminfo - Display system information",
-                "tasklist - List running processes",
-                "ipconfig - Display network configuration",
-                "date /t - Display current date",
-                "time /t - Display current time"
-            ],
-            "Navigation": [
-                "cd folder_name - Change directory",
-                "cd .. - Go up one directory",
-                "cd \\ - Go to root directory"
-            ]
-        }
-    else:
-        return {
-            "File Operations": [
-                "ls -la - List directory contents with details",
-                "mkdir folder_name - Create directory",
-                "rmdir folder_name - Remove empty directory",
-                "cp file1.txt file2.txt - Copy file",
-                "mv file1.txt new_location/ - Move file",
-                "rm file.txt - Delete file"
-            ],
-            "System Info": [
-                "ps aux - List running processes",
-                "top - Display running processes",
-                "df -h - Display disk usage",
-                "free -h - Display memory usage",
-                "uname -a - Display system information",
-                "date - Display current date and time"
-            ],
-            "Navigation": [
-                "cd folder_name - Change directory",
-                "cd .. - Go up one directory",
-                "cd ~ - Go to home directory",
-                "pwd - Print working directory"
-            ]
-        }
-
-
-# Test utilities
-def test_utils():
-    """Test utility functions"""
-    print("🧪 Testing TermiAI Utilities...")
-
-    # Test ConfigManager
-    print("\n📝 Testing ConfigManager...")
-    config_manager = ConfigManager("test_config.json")
-    config = config_manager.load_config()
-    print(f"✅ Config loaded: {len(config)} settings")
-    
-    # Test config validation
-    is_valid = config_manager.validate_config(config)
-    print(f"✅ Config validation: {'Passed' if is_valid else 'Failed'}")
-
-    # Test Logger
-    print("\n📋 Testing Logger...")
-    logger = Logger("test_logs")
-    logger.log_info("Test message", "utils_test")
-    logger.log_interaction("test input", "test command", True, "text")
-    logger.log_command_execution("echo test", "success", "test output")
-    
-    stats = logger.get_log_stats()
-    print(f"✅ Logger stats: {stats}")
-
-    # Test PlatformUtils
-    print("\n🖥️  Testing PlatformUtils...")
-    platform_utils = PlatformUtils()
-    print(f"Platform: {platform_utils.get_platform()}")
-    print(f"Home: {platform_utils.get_home_directory()}")
-    print(f"Shell: {platform_utils.get_shell_command()}")
-    print(f"Admin: {platform_utils.is_admin()}")
-
-    # Test ColorUtils
-    print("\n🎨 Testing ColorUtils...")
-    print(ColorUtils.success("✅ Success message"))
-    print(ColorUtils.error("❌ Error message"))
-    print(ColorUtils.warning("⚠️  Warning message"))
-    print(ColorUtils.info("ℹ️  Info message"))
-    print(ColorUtils.highlight("🔥 Highlighted message"))
-
-    # Test FileUtils
-    print("\n📁 Testing FileUtils...")
-    FileUtils.ensure_directory("test_directory")
-    safe_name = FileUtils.safe_filename("unsafe<>filename?.txt")
-    print(f"Safe filename: {safe_name}")
-
-    # Test utility functions
-    print("\n🔧 Testing utility functions...")
-    print(f"File size: {format_file_size(1024 * 1024 * 5)}")
-    print(f"Duration: {format_duration(125.5)}")
-    print(f"URL valid: {validate_url('https://example.com')}")
+            try:
+                # Get local IP address
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect(("8.8.8.8", 80))
+                local_ip = s.getsockname()[0]
+                s.close()
+                network_info["local_ip"] = local_ip
+            except Exception:
+                network_
