@@ -1,0 +1,19 @@
+# Core dependencies
+pip~=24.0
+attrs~=23.2.0
+distro~=1.9.0
+wheel~=0.42.0
+cryptography~=41.0.7
+pillow~=10.2.0
+Jinja2~=3.1.2
+aiohttp
+
+# AI & audio processing
+faster-whisper
+pyaudio
+
+# Notes:
+# If you get a build error for pyaudio like:
+# "fatal error: portaudio.h: No such file or directory"
+# Run this system-level fix on Ubuntu/Debian:
+# sudo apt install portaudio19-dev python3-dev
