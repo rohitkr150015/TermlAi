@@ -786,4 +786,463 @@ class PlatformUtils:
                 s.close()
                 network_info["local_ip"] = local_ip
             except Exception:
-                network_
+                network_info["local_ip"] = "unavailable"
+                
+            # Check internet connectivity
+            try:
+                socket.create_connection(("8.8.8.8", 53), timeout=3)
+                network_info["internet_connected"] = True
+            except Exception:
+                network_info["internet_connected"] = False
+                
+        except Exception:
+            network_info = {"error": "Network info unavailable"}
+            
+        return network_info
+
+    def can_execute_command(self, command: str) -> Dict[str, Any]:
+        """Check if a command can be executed on current platform"""
+        result = {
+            "executable": False,
+            "reason": "",
+            "suggested_alternative": "",
+            "requires_admin": False
+        }
+        
+        # Extract command name
+        cmd_parts = command.strip().split()
+        if not cmd_parts:
+            result["reason"] = "Empty command"
+            return result
+            
+        cmd_name = cmd_parts[0].lower()
+        
+        # Platform-specific command checking
+        platform_commands = {
+            "windows": {
+                "ls": {"alt": "dir", "executable": True},
+                "cat": {"alt": "type", "executable": True},
+                "grep": {"alt": "findstr", "executable": True},
+                "ps": {"alt": "tasklist", "executable": True},
+                "kill": {"alt": "taskkill", "executable": True},
+                "pwd": {"alt": "cd", "executable": True},
+                "rm": {"alt": "del", "executable": True},
+                "cp": {"alt": "copy", "executable": True},
+                "mv": {"alt": "move", "executable": True}
+            },
+            "linux": {
+                "dir": {"alt": "ls", "executable": True},
+                "type": {"alt": "cat", "executable": True},
+                "findstr": {"alt": "grep", "executable": True},
+                "tasklist": {"alt": "ps", "executable": True},
+                "taskkill": {"alt": "kill", "executable": True}
+            },
+            "darwin": {
+                "dir": {"alt": "ls", "executable": True},
+                "type": {"alt": "cat", "executable": True},
+                "findstr": {"alt": "grep", "executable": True},
+                "tasklist": {"alt": "ps", "executable": True},
+                "taskkill": {"alt": "kill", "executable": True}
+            }
+        }
+        
+        # Check if command exists in PATH
+        if shutil.which(cmd_name):
+            result["executable"] = True
+            result["reason"] = "Command found in PATH"
+        elif cmd_name in platform_commands.get(self.platform, {}):
+            cmd_info = platform_commands[self.platform][cmd_name]
+            result["executable"] = cmd_info["executable"]
+            result["suggested_alternative"] = cmd_info["alt"]
+            result["reason"] = f"Platform-specific alternative available: {cmd_info['alt']}"
+        else:
+            result["reason"] = "Command not found"
+            
+        # Check for admin requirements
+        admin_commands = [
+            "sudo", "su", "systemctl", "service", "mount", "umount",
+            "fdisk", "parted", "iptables", "netstat", "ss", "tcpdump",
+            "chown", "chmod", "passwd", "useradd", "userdel", "groupadd"
+        ]
+        
+        if cmd_name in admin_commands or any(word in command.lower() for word in ["sudo", "admin", "root"]):
+            result["requires_admin"] = True
+            
+        return result
+
+    def format_file_size(self, size_bytes: int) -> str:
+        """Format file size in human readable format"""
+        if size_bytes == 0:
+            return "0 B"
+            
+        size_names = ["B", "KB", "MB", "GB", "TB", "PB"]
+        i = 0
+        while size_bytes >= 1024 and i < len(size_names) - 1:
+            size_bytes /= 1024.0
+            i += 1
+            
+        return f"{size_bytes:.1f} {size_names[i]}"
+
+    def get_file_info(self, file_path: str) -> Dict[str, Any]:
+        """Get detailed file information"""
+        path = Path(file_path)
+        
+        if not path.exists():
+            return {"error": "File not found"}
+            
+        try:
+            stat = path.stat()
+            info = {
+                "name": path.name,
+                "path": str(path.absolute()),
+                "size": stat.st_size,
+                "size_formatted": self.format_file_size(stat.st_size),
+                "is_file": path.is_file(),
+                "is_directory": path.is_dir(),
+                "is_symlink": path.is_symlink(),
+                "created": datetime.fromtimestamp(stat.st_ctime).isoformat(),
+                "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                "accessed": datetime.fromtimestamp(stat.st_atime).isoformat(),
+                "permissions": oct(stat.st_mode)[-3:],
+                "owner_readable": os.access(path, os.R_OK),
+                "owner_writable": os.access(path, os.W_OK),
+                "owner_executable": os.access(path, os.X_OK)
+            }
+            
+            # Add file extension info
+            if path.is_file():
+                info["extension"] = path.suffix.lower()
+                info["stem"] = path.stem
+                
+            # Add directory contents count
+            if path.is_dir():
+                try:
+                    contents = list(path.iterdir())
+                    info["contents_count"] = len(contents)
+                    info["subdirectories"] = sum(1 for item in contents if item.is_dir())
+                    info["files"] = sum(1 for item in contents if item.is_file())
+                except PermissionError:
+                    info["contents_count"] = "Permission denied"
+                    
+            return info
+            
+        except Exception as e:
+            return {"error": f"Error getting file info: {e}"}
+
+
+class CommandSafetyChecker:
+    """Checks command safety and provides warnings"""
+    
+    def __init__(self, safety_level: str = "normal"):
+        """Initialize safety checker"""
+        self.safety_level = safety_level.lower()
+        self.dangerous_commands = self._get_dangerous_commands()
+        self.risky_patterns = self._get_risky_patterns()
+        
+    def _get_dangerous_commands(self) -> Dict[str, Dict[str, str]]:
+        """Get list of dangerous commands by category"""
+        return {
+            "destructive": {
+                "rm -rf": "Recursively delete files/directories",
+                "del /f /s /q": "Force delete files on Windows",
+                "format": "Format disk/drive",
+                "fdisk": "Partition disk",
+                "dd": "Direct disk write (can destroy data)",
+                "mkfs": "Create filesystem (destroys existing data)",
+                "shred": "Securely delete files",
+                "wipe": "Securely wipe files"
+            },
+            "system_critical": {
+                "shutdown": "Shutdown system",
+                "reboot": "Restart system",
+                "halt": "Stop system",
+                "init": "Change system runlevel",
+                "systemctl": "Control system services",
+                "service": "Control system services",
+                "killall": "Kill all processes by name",
+                "pkill": "Kill processes by pattern"
+            },
+            "network_risky": {
+                "iptables": "Modify firewall rules",
+                "ufw": "Configure firewall",
+                "netsh": "Network configuration on Windows",
+                "ifconfig": "Network interface configuration",
+                "ip": "Network configuration",
+                "route": "Modify routing table"
+            },
+            "privilege_escalation": {
+                "sudo": "Execute as superuser",
+                "su": "Switch user",
+                "runas": "Run as different user on Windows",
+                "chmod": "Change file permissions",
+                "chown": "Change file ownership"
+            }
+        }
+    
+    def _get_risky_patterns(self) -> List[Dict[str, str]]:
+        """Get risky command patterns"""
+        return [
+            {"pattern": r"rm\s+.*-rf", "risk": "Recursive force delete"},
+            {"pattern": r">\s*/dev/null", "risk": "Suppress all output"},
+            {"pattern": r"2>&1", "risk": "Redirect error output"},
+            {"pattern": r"\|\s*sh", "risk": "Pipe to shell"},
+            {"pattern": r"curl.*\|\s*bash", "risk": "Download and execute script"},
+            {"pattern": r"wget.*\|\s*sh", "risk": "Download and execute script"},
+            {"pattern": r"--force", "risk": "Force operation"},
+            {"pattern": r"-f\s", "risk": "Force flag"},
+            {"pattern": r"/\*", "risk": "Wildcard in root"},
+            {"pattern": r"\$\(.*\)", "risk": "Command substitution"},
+            {"pattern": r"`.*`", "risk": "Command substitution"},
+            {"pattern": r"&&", "risk": "Chain commands"},
+            {"pattern": r"\|\|", "risk": "Conditional execution"},
+            {"pattern": r"&\s*$", "risk": "Background execution"}
+        ]
+    
+    def check_command_safety(self, command: str) -> Dict[str, Any]:
+        """Check if command is safe to execute"""
+        result = {
+            "safe": True,
+            "risk_level": "low",
+            "warnings": [],
+            "blocked": False,
+            "reason": "",
+            "suggestions": []
+        }
+        
+        command_lower = command.lower().strip()
+        
+        # Check for dangerous commands
+        for category, commands in self.dangerous_commands.items():
+            for dangerous_cmd, description in commands.items():
+                if dangerous_cmd in command_lower:
+                    risk_level = self._get_risk_level(category)
+                    result["warnings"].append({
+                        "type": category,
+                        "command": dangerous_cmd,
+                        "description": description,
+                        "risk_level": risk_level
+                    })
+                    
+                    if risk_level == "critical":
+                        result["safe"] = False
+                        result["risk_level"] = "critical"
+                        
+                        if self.safety_level == "strict":
+                            result["blocked"] = True
+                            result["reason"] = f"Blocked dangerous command: {dangerous_cmd}"
+        
+        # Check for risky patterns
+        for pattern_info in self.risky_patterns:
+            if re.search(pattern_info["pattern"], command):
+                result["warnings"].append({
+                    "type": "pattern",
+                    "pattern": pattern_info["pattern"],
+                    "risk": pattern_info["risk"],
+                    "risk_level": "medium"
+                })
+                
+                if result["risk_level"] == "low":
+                    result["risk_level"] = "medium"
+        
+        # Provide suggestions based on safety level
+        if result["warnings"]:
+            result["suggestions"] = self._get_safety_suggestions(command, result["warnings"])
+        
+        # Apply safety level rules
+        if self.safety_level == "strict" and result["risk_level"] in ["high", "critical"]:
+            result["blocked"] = True
+            result["reason"] = f"Command blocked due to {result['risk_level']} risk level"
+        elif self.safety_level == "permissive":
+            result["blocked"] = False
+            
+        return result
+    
+    def _get_risk_level(self, category: str) -> str:
+        """Get risk level for command category"""
+        risk_levels = {
+            "destructive": "critical",
+            "system_critical": "high", 
+            "network_risky": "medium",
+            "privilege_escalation": "medium"
+        }
+        return risk_levels.get(category, "low")
+    
+    def _get_safety_suggestions(self, command: str, warnings: List[Dict]) -> List[str]:
+        """Get safety suggestions based on warnings"""
+        suggestions = []
+        
+        # Generic suggestions
+        suggestions.append("Review the command carefully before execution")
+        suggestions.append("Consider using --dry-run or --preview flags if available")
+        suggestions.append("Make sure you have backups of important data")
+        
+        # Specific suggestions based on warnings
+        for warning in warnings:
+            if warning["type"] == "destructive":
+                suggestions.append("Double-check file paths and use absolute paths")
+                suggestions.append("Test with a small subset first")
+            elif warning["type"] == "system_critical":
+                suggestions.append("Ensure no critical processes will be affected")
+                suggestions.append("Consider scheduling during maintenance window")
+            elif warning["type"] == "privilege_escalation":
+                suggestions.append("Verify you have necessary permissions")
+                suggestions.append("Use minimal required privileges")
+        
+        return list(set(suggestions))  # Remove duplicates
+
+
+class TextUtils:
+    """Text processing utilities"""
+    
+    @staticmethod
+    def clean_text(text: str) -> str:
+        """Clean and normalize text"""
+        if not text:
+            return ""
+        
+        # Remove extra whitespace
+        text = re.sub(r'\s+', ' ', text.strip())
+        
+        # Remove control characters
+        text = ''.join(char for char in text if ord(char) >= 32 or char in '\t\n\r')
+        
+        return text
+    
+    @staticmethod
+    def truncate_text(text: str, max_length: int = 100, suffix: str = "...") -> str:
+        """Truncate text to specified length"""
+        if not text or len(text) <= max_length:
+            return text
+        
+        return text[:max_length - len(suffix)] + suffix
+    
+    @staticmethod
+    def extract_commands(text: str) -> List[str]:
+        """Extract potential commands from text"""
+        # Common command patterns
+        patterns = [
+            r'`([^`]+)`',  # Backticks
+            r'"([^"]*(?:ls|cd|mkdir|rm|cp|mv|grep|find|cat|echo|pwd|chmod|chown)[^"]*)"',  # Quoted commands
+            r"'([^']*(?:ls|cd|mkdir|rm|cp|mv|grep|find|cat|echo|pwd|chmod|chown)[^']*)'",  # Single quoted
+        ]
+        
+        commands = []
+        for pattern in patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            commands.extend(matches)
+        
+        # Clean and filter commands
+        cleaned_commands = []
+        for cmd in commands:
+            cleaned = TextUtils.clean_text(cmd)
+            if cleaned and len(cleaned) > 2:
+                cleaned_commands.append(cleaned)
+        
+        return list(set(cleaned_commands))  # Remove duplicates
+    
+    @staticmethod
+    def highlight_text(text: str, terms: List[str], color_code: str = "\033[93m") -> str:
+        """Highlight specific terms in text"""
+        if not terms:
+            return text
+        
+        reset_code = "\033[0m"
+        highlighted = text
+        
+        for term in terms:
+            pattern = re.compile(re.escape(term), re.IGNORECASE)
+            highlighted = pattern.sub(f"{color_code}{term}{reset_code}", highlighted)
+        
+        return highlighted
+    
+    @staticmethod
+    def parse_key_value_pairs(text: str, separator: str = "=") -> Dict[str, str]:
+        """Parse key-value pairs from text"""
+        pairs = {}
+        
+        for line in text.split('\n'):
+            line = line.strip()
+            if separator in line and not line.startswith('#'):
+                key, value = line.split(separator, 1)
+                pairs[key.strip()] = value.strip().strip('"\'')
+        
+        return pairs
+    
+    @staticmethod
+    def format_duration(seconds: float) -> str:
+        """Format duration in human readable format"""
+        if seconds < 1:
+            return f"{seconds * 1000:.0f}ms"
+        elif seconds < 60:
+            return f"{seconds:.1f}s"
+        elif seconds < 3600:
+            minutes = int(seconds // 60)
+            remaining_seconds = seconds % 60
+            return f"{minutes}m {remaining_seconds:.0f}s"
+        else:
+            hours = int(seconds // 3600)
+            minutes = int((seconds % 3600) // 60)
+            return f"{hours}h {minutes}m"
+
+
+# Utility functions for easy access
+def get_platform_utils() -> PlatformUtils:
+    """Get platform utilities instance"""
+    return PlatformUtils()
+
+def get_config_manager(config_file: str = "config.json") -> ConfigManager:
+    """Get configuration manager instance"""
+    return ConfigManager(config_file)
+
+def get_logger(log_dir: str = "logs") -> Logger:
+    """Get logger instance"""
+    return Logger(log_dir)
+
+def get_safety_checker(safety_level: str = "normal") -> CommandSafetyChecker:
+    """Get command safety checker instance"""
+    return CommandSafetyChecker(safety_level)
+
+def clean_command_output(output: str) -> str:
+    """Clean command output for display"""
+    return TextUtils.clean_text(output)
+
+def check_system_requirements() -> Dict[str, bool]:
+    """Check if system meets requirements"""
+    requirements = {
+        "python_version": False,
+        "disk_space": False,
+        "memory": False,
+        "network": False
+    }
+    
+    # Check Python version (3.8+)
+    import sys
+    if sys.version_info >= (3, 8):
+        requirements["python_version"] = True
+    
+    # Check disk space (at least 1GB free)
+    try:
+        _, _, free = shutil.disk_usage(os.getcwd())
+        if free > 1024**3:  # 1GB
+            requirements["disk_space"] = True
+    except:
+        pass
+    
+    # Check memory (basic check)
+    try:
+        import psutil
+        memory = psutil.virtual_memory()
+        if memory.available > 512 * 1024 * 1024:  # 512MB
+            requirements["memory"] = True
+    except:
+        requirements["memory"] = True  # Assume OK if can't check
+    
+    # Check network
+    try:
+        import socket
+        socket.create_connection(("8.8.8.8", 53), timeout=3)
+        requirements["network"] = True
+    except:
+        pass
+    
+    return requirements
