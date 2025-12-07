@@ -2,6 +2,8 @@ TermlAi 🎙️🤖
 
 Voice-Controlled Terminal Assistant with AI Command Generation
 
+<video src="https://github.com/user-attachments/assets/4ee376fb-8e66-4bb1-a4f0-84d9db91886e" controls></video>
+
 TermlAi is an intelligent terminal assistant that converts natural language voice commands into executable terminal commands using Faster-Whisper for speech recognition and Ollama (phi3) for command generation.
 
 ✨ Features
